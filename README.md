@@ -4,7 +4,7 @@
 
 The lite version of Qubic Core that can run directly on the OS without a UEFI environment.
 
-[Compare core-lite (develop) vs. core (develop)](https://www.google.com/search?q=https://github.com/qubic/core-lite/compare/develop...qubic:core:develop)
+[Compare core-lite (develop) vs. core (develop)](https://github.com/qubic/core-lite/compare/develop...qubic:core:develop)
 
 ## Menu
 
@@ -204,3 +204,4 @@ Delete the **system** file at your current working folder, it may make your node
 - [x] Windows
 
 - [x] Linux
+
