@@ -209,7 +209,7 @@ The image includes a Docker health check that queries the node's HTTP API every 
 ## Requirements
 
 - **CPU**: x86_64 (AVX2 support recommended)
-- **RAM**: 32GB+ recommended for mainnet
+- **RAM**: 64GB minimum for mainnet
 - **Disk**: 50GB+ for state files
 - **Network**: Stable connection with port 21841 accessible for P2P
 
