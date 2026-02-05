@@ -180,7 +180,15 @@ class Orchestrator:
             str(self._data_dir / "version.txt")
         )
 
-        if staged_ver and local_ver and local_ver >= staged_ver:
+        # Compare version and file modification time — a recompiled binary
+        # with the same version but a newer mtime should still be installed.
+        staged_bin = staging_dir / "Qubic"
+        local_bin = self._data_dir / "Qubic"
+        staged_newer = False
+        if staged_bin.exists() and local_bin.exists():
+            staged_newer = staged_bin.stat().st_mtime > local_bin.stat().st_mtime
+
+        if staged_ver and local_ver and local_ver >= staged_ver and not staged_newer:
             logger.info(
                 f"Binary on volume "
                 f"({EpochService.format_version(local_ver)}) is "
