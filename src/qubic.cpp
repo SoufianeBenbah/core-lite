@@ -3866,7 +3866,7 @@ static void processTick(unsigned long long processorNumber)
 
                     // sign and broadcast tx
                     KangarooTwelve(tx, sizeof(Transaction) + tx->inputSize, digest, sizeof(digest));
-                    sign(computorSubseeds[i].m256i_u8, computorPublicKeys[i].m256i_u8, digest, tx->signaturePtr());
+                    sign(computorSubseeds[ownCompIdx].m256i_u8, computorPublicKeys[ownCompIdx].m256i_u8, digest, tx->signaturePtr());
                     enqueueResponse(NULL, tx->totalSize(), BROADCAST_TRANSACTION, 0, tx);
                     ++txCount;
                 }
@@ -4256,8 +4256,9 @@ static void endEpoch()
         constexpr long long issuancePerComputor = ISSUANCE_RATE / NUMBER_OF_COMPUTORS;
         for (unsigned int computorIndex = 0; computorIndex < NUMBER_OF_COMPUTORS; computorIndex++)
         {
-            // Compute initial computor revenue, reducing arbitrator revenue
-            long long revenue = gRevenueComponents.revenue[computorIndex];
+            // TODO: Remove this and uncomment the line below to restore normal revenue distribution
+            long long revenue = issuancePerComputor;
+            // long long revenue = gRevenueComponents.revenue[computorIndex];
             arbitratorRevenue -= revenue;
 
             // Reduce computor revenue based on revenue donation table agreed on by quorum
