@@ -114,6 +114,9 @@ class ChunkedScpUploader(ScpUploader):
 
     After all chunks are uploaded, they are reassembled on the
     remote server using cat.
+
+    Also supports uploading pre-split chunks (from streaming compression)
+    via the upload_chunks() method.
     """
 
     def __init__(
@@ -138,6 +141,7 @@ class ChunkedScpUploader(ScpUploader):
             timeout=timeout,
         )
         self._chunk_size = chunk_size_mb * 1024 * 1024  # Convert to bytes
+        self._chunk_size_mb = chunk_size_mb
         self._chunk_timeout = chunk_timeout
         self._parallel_chunks = parallel_chunks
         self._min_chunk_size = min_chunk_size_gb * 1024 * 1024 * 1024  # bytes
@@ -194,6 +198,241 @@ class ChunkedScpUploader(ScpUploader):
                 error_message=str(e),
                 duration_seconds=time.monotonic() - start,
             )
+
+    async def upload_chunks(
+        self,
+        chunk_files: list[Path],
+        metadata: dict,
+        remote_key: str,
+        total_uncompressed_size: int = 0,
+    ) -> UploadResult:
+        """Upload pre-split chunk files with resume capability.
+
+        This method is used when chunks were created by streaming compression
+        (tar | zstd | split) and already exist on disk.
+
+        Args:
+            chunk_files: List of chunk file paths in order.
+            metadata: Metadata dict with epoch, tick, etc.
+            remote_key: Remote path for the final reassembled file.
+            total_uncompressed_size: Original uncompressed size (for logging).
+
+        Returns:
+            UploadResult indicating success or failure.
+        """
+        start = time.monotonic()
+
+        if not chunk_files:
+            return UploadResult(
+                success=False,
+                error_message="No chunk files provided",
+                duration_seconds=0,
+            )
+
+        epoch = metadata.get("epoch", 0)
+        tick = metadata.get("tick", 0)
+
+        # Calculate total size
+        total_size = sum(c.stat().st_size for c in chunk_files)
+
+        logger.info(
+            f"Uploading {len(chunk_files)} pre-split chunks "
+            f"({total_size / (1024**3):.2f} GB compressed)"
+        )
+
+        try:
+            result = await self._upload_presplit_chunks(
+                chunk_files=chunk_files,
+                epoch=epoch,
+                tick=tick,
+                remote_key=remote_key,
+                total_size=total_size,
+            )
+            result.duration_seconds = time.monotonic() - start
+            return result
+        except Exception as e:
+            logger.error(f"Pre-split chunk upload failed: {e}", exc_info=True)
+            return UploadResult(
+                success=False,
+                error_message=str(e),
+                duration_seconds=time.monotonic() - start,
+            )
+
+    async def _upload_presplit_chunks(
+        self,
+        chunk_files: list[Path],
+        epoch: int,
+        tick: int,
+        remote_key: str,
+        total_size: int,
+    ) -> UploadResult:
+        """Upload pre-split chunks with resume capability."""
+        from datetime import datetime, timezone
+
+        staging_dir = chunk_files[0].parent
+        # Derive archive name from remote key (e.g., "199/ep199-t123-snap.tar.zst")
+        archive_name = Path(remote_key).name
+
+        # Compute combined checksum of all chunks
+        logger.info("Computing combined checksum of chunks...")
+        combined_checksum = await asyncio.to_thread(
+            self._compute_combined_checksum, chunk_files
+        )
+
+        # Check for existing manifest (resume case)
+        manifest = await self._load_remote_manifest(epoch)
+        if manifest and manifest.checksum == combined_checksum:
+            logger.info(
+                f"Resuming upload: {manifest.uploaded_count}/{len(manifest.chunks)} "
+                f"chunks already uploaded"
+            )
+        else:
+            if manifest:
+                logger.info(
+                    "Chunks changed since last upload attempt, starting fresh"
+                )
+                await self._cleanup_remote_chunks(epoch)
+
+            # Create manifest for pre-split chunks
+            chunks = []
+            for i, chunk_path in enumerate(chunk_files):
+                chunk_checksum = await asyncio.to_thread(
+                    self._compute_file_checksum, chunk_path
+                )
+                chunks.append(
+                    ChunkEntry(
+                        index=i,
+                        filename=chunk_path.name,
+                        size=chunk_path.stat().st_size,
+                        checksum=chunk_checksum,
+                        uploaded=False,
+                    )
+                )
+
+            manifest = ChunkManifest(
+                epoch=epoch,
+                tick=tick,
+                archive_name=archive_name,
+                total_size=total_size,
+                chunk_size=self._chunk_size,
+                checksum=combined_checksum,
+                status="uploading",
+                chunks=chunks,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+        # Ensure remote directory exists
+        await self._ensure_remote_chunks_dir(epoch)
+
+        # Save manifest to remote
+        manifest.status = "uploading"
+        await self._save_remote_manifest(epoch, manifest)
+
+        # Upload pending chunks
+        upload_success = await self._upload_pending_chunks(
+            manifest=manifest,
+            staging_dir=staging_dir,
+            epoch=epoch,
+        )
+        if not upload_success:
+            manifest.status = "failed"
+            await self._save_remote_manifest(epoch, manifest)
+            return UploadResult(
+                success=False,
+                error_message="Failed to upload all chunks",
+            )
+
+        # Reassemble on remote
+        logger.info("Reassembling chunks on remote server...")
+        manifest.status = "assembling"
+        await self._save_remote_manifest(epoch, manifest)
+
+        reassemble_success = await self._reassemble_on_remote(
+            manifest=manifest,
+            epoch=epoch,
+            remote_key=remote_key,
+        )
+        if not reassemble_success:
+            manifest.status = "failed"
+            await self._save_remote_manifest(epoch, manifest)
+            return UploadResult(
+                success=False,
+                error_message="Failed to reassemble chunks on remote",
+            )
+
+        # Verify size on remote (skip checksum for streaming - it's different)
+        logger.info("Verifying remote file size...")
+        verify_ok = await self._verify_remote_size(
+            remote_key=remote_key,
+            expected_size=total_size,
+        )
+        if not verify_ok:
+            manifest.status = "failed"
+            await self._save_remote_manifest(epoch, manifest)
+            return UploadResult(
+                success=False,
+                error_message="Remote size verification failed",
+            )
+
+        # Cleanup
+        logger.info("Cleaning up remote chunks...")
+        manifest.status = "complete"
+        await self._save_remote_manifest(epoch, manifest)
+        await self._cleanup_remote_chunks(epoch)
+
+        # Local chunk cleanup is handled by caller
+        logger.info(
+            f"Pre-split chunk upload complete: {total_size} bytes in "
+            f"{len(manifest.chunks)} chunks"
+        )
+
+        return UploadResult(
+            success=True,
+            remote_url=f"{self._target()}:{self._remote_path(remote_key)}",
+            bytes_uploaded=total_size,
+        )
+
+    def _compute_combined_checksum(self, chunk_files: list[Path]) -> str:
+        """Compute a combined checksum of all chunk files."""
+        sha256 = hashlib.sha256()
+        for chunk_path in chunk_files:
+            with open(chunk_path, "rb") as f:
+                while data := f.read(BUFFER_SIZE):
+                    sha256.update(data)
+        return sha256.hexdigest()
+
+    async def _verify_remote_size(
+        self,
+        remote_key: str,
+        expected_size: int,
+    ) -> bool:
+        """Verify the size of the reassembled file on remote."""
+        remote_path = self._remote_path(remote_key)
+
+        try:
+            code, stdout, stderr = await self._run_ssh(
+                f"stat -c '%s' {remote_path}", timeout=30
+            )
+            if code != 0:
+                logger.error(
+                    f"Remote size check failed: {stderr.strip()}"
+                )
+                return False
+
+            remote_size = int(stdout.strip())
+            if remote_size != expected_size:
+                logger.error(
+                    f"Size mismatch: expected {expected_size}, "
+                    f"got {remote_size}"
+                )
+                return False
+
+            logger.info(f"Remote size verified: {remote_size} bytes")
+            return True
+
+        except Exception as e:
+            logger.error(f"Remote size verification error: {e}")
+            return False
 
     async def _chunked_upload(
         self,
@@ -456,11 +695,14 @@ class ChunkedScpUploader(ScpUploader):
             return True
 
         total = len(manifest.chunks)
+        pending_bytes = sum(c.size for c in pending)
         logger.info(
-            f"Uploading {len(pending)} pending chunks "
-            f"({manifest.uploaded_count}/{total} already done)"
+            f"Starting upload: {len(pending)}/{total} chunks "
+            f"({pending_bytes / (1024**3):.2f} GB to upload, "
+            f"{self._parallel_chunks} parallel)"
         )
 
+        upload_start_time = time.monotonic()
         semaphore = asyncio.Semaphore(self._parallel_chunks)
         failed = False
 
@@ -474,6 +716,7 @@ class ChunkedScpUploader(ScpUploader):
                     staging_dir=staging_dir,
                     epoch=epoch,
                     manifest=manifest,
+                    upload_start_time=upload_start_time,
                 )
                 if not success:
                     failed = True
@@ -492,6 +735,14 @@ class ChunkedScpUploader(ScpUploader):
             if not result:
                 return False
 
+        # Final summary
+        total_duration = time.monotonic() - upload_start_time
+        avg_speed = (pending_bytes / total_duration) / (1024 * 1024) if total_duration > 0 else 0
+        logger.info(
+            f"Upload complete: {pending_bytes / (1024**3):.2f} GB in {total_duration:.0f}s "
+            f"(avg {avg_speed:.1f} MB/s)"
+        )
+
         return True
 
     async def _upload_single_chunk(
@@ -500,6 +751,7 @@ class ChunkedScpUploader(ScpUploader):
         staging_dir: Path,
         epoch: int,
         manifest: ChunkManifest,
+        upload_start_time: float,
     ) -> bool:
         """Upload a single chunk with dedicated timeout."""
         chunk_path = staging_dir / chunk.filename
@@ -513,10 +765,7 @@ class ChunkedScpUploader(ScpUploader):
 
         cmd = ["scp"] + self._scp_opts() + [str(chunk_path), scp_target]
 
-        logger.info(
-            f"Uploading chunk {chunk.index + 1}/{len(manifest.chunks)}: "
-            f"{chunk.filename} ({chunk.size} bytes)"
-        )
+        chunk_start = time.monotonic()
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -545,13 +794,35 @@ class ChunkedScpUploader(ScpUploader):
                 )
                 return False
 
+            # Verify chunk checksum on remote server
+            remote_chunk_path = self._remote_path(remote_chunk_key)
+            if not await self._verify_remote_chunk_checksum(
+                remote_chunk_path, chunk.checksum, chunk.filename
+            ):
+                logger.error(
+                    f"Chunk {chunk.filename} checksum verification failed - "
+                    "data may be corrupted during transfer"
+                )
+                # Delete corrupted chunk on remote
+                await self._run_ssh(f"rm -f {remote_chunk_path}", timeout=30)
+                return False
+
             # Mark as uploaded and save manifest
             chunk.uploaded = True
             await self._save_remote_manifest(epoch, manifest)
 
-            logger.debug(
-                f"Chunk {chunk.filename} uploaded successfully "
-                f"({manifest.uploaded_count}/{len(manifest.chunks)})"
+            # Calculate progress and speed
+            chunk_duration = time.monotonic() - chunk_start
+            total_elapsed = time.monotonic() - upload_start_time
+            speed_mbps = (chunk.size / chunk_duration) / (1024 * 1024) if chunk_duration > 0 else 0
+            uploaded_bytes = manifest.uploaded_bytes
+            total_bytes = manifest.total_size
+            pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
+
+            logger.info(
+                f"Uploaded chunk {manifest.uploaded_count}/{len(manifest.chunks)} "
+                f"({pct:.0f}%) - {uploaded_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB "
+                f"@ {speed_mbps:.1f} MB/s - {total_elapsed:.0f}s elapsed"
             )
             return True
 
@@ -615,6 +886,43 @@ class ChunkedScpUploader(ScpUploader):
             return False
         except Exception as e:
             logger.error(f"Reassembly error: {e}")
+            return False
+
+    async def _verify_remote_chunk_checksum(
+        self,
+        remote_path: str,
+        expected_checksum: str,
+        chunk_name: str,
+    ) -> bool:
+        """Verify the checksum of a single chunk on remote server."""
+        try:
+            code, stdout, stderr = await self._run_ssh(
+                f"sha256sum {remote_path}", timeout=120
+            )
+            if code != 0:
+                logger.error(
+                    f"Remote chunk checksum command failed for {chunk_name}: "
+                    f"{stderr.strip()}"
+                )
+                return False
+
+            remote_checksum = stdout.strip().split()[0]
+            if remote_checksum != expected_checksum:
+                logger.error(
+                    f"Chunk {chunk_name} checksum mismatch: "
+                    f"expected {expected_checksum[:16]}..., "
+                    f"got {remote_checksum[:16]}..."
+                )
+                return False
+
+            logger.debug(f"Chunk {chunk_name} checksum verified")
+            return True
+
+        except asyncio.TimeoutError:
+            logger.error(f"Chunk {chunk_name} checksum verification timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Chunk {chunk_name} checksum verification error: {e}")
             return False
 
     async def _verify_remote_checksum(
