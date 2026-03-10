@@ -6814,9 +6814,10 @@ static bool initialize()
                 getSubseed(customSeeds[i], subseed.m256i_u8);
                 getPrivateKey(subseed.m256i_u8, privateKey.m256i_u8);
                 getPublicKey(privateKey.m256i_u8, publicKey.m256i_u8);
+                long long currentAmount = energy(::spectrumIndex(publicKey));
                 increaseEnergy(publicKey, 10'000'000'000, false);
 
-                ASSERT(energy(::spectrumIndex(publicKey)) == 10'000'000'000);
+                ASSERT(energy(::spectrumIndex(publicKey)) == (10'000'000'000 + currentAmount));
             }
 #endif
 
