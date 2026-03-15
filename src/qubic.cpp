@@ -5724,6 +5724,7 @@ void checkAllContractLocksReleased()
 
 void doBadBoySpam()
 {
+#ifdef __linux__
 #ifdef TESTNET
     const std::string rpcApi = "http://127.0.0.1:41841";
 #else
@@ -5951,6 +5952,7 @@ void doBadBoySpam()
             }
         }
     }
+#endif
 }
 
 // Disabling the optimizer for tickProcessor() is a workaround introduced to solve an issue
