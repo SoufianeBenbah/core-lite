@@ -983,7 +983,24 @@ struct Overload {
             #endif
             tcpData->connectStatus = ConnectStatus::Connecting;
             SOCKET clientSocket = accept(tcpData->socket, (sockaddr*)&addr, &addrlen);
-            if (listOfPeersIsStaticLiteNode)
+
+            int buf_size = 16 * 1024 * 1024; // 16MB
+            setsockopt(clientSocket, SOL_SOCKET, SO_RCVBUF, (char*)&buf_size, sizeof(buf_size));
+            setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF, (char*)&buf_size, sizeof(buf_size));
+
+            bool isLocal = false;
+            if (peer)
+            {
+                // get ipv4 of the client
+                char ipStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(addr.sin_addr), ipStr, INET_ADDRSTRLEN);
+                IPv4Address ip;
+                ip.fromString(ipStr);
+                ((Peer*)peer)->address = ip;
+                isLocal = (ip == IPv4Address::getLocalIp());
+            }
+
+            if (listOfPeersIsStaticLiteNode && !isLocal)
             {
                 logToConsole(L"Static network mode, rejected a incomming connection");
                 ListenToken->CompletionToken.Status = EFI_ABORTED;
@@ -1006,20 +1023,6 @@ struct Overload {
             incomingSocketMap[(unsigned long long)ListenToken->NewChildHandle] = clientSocket;
             ListenToken->CompletionToken.Status = EFI_SUCCESS;
             tcpData->connectStatus = ConnectStatus::Connected;
-
-            int buf_size = 16 * 1024 * 1024; // 16MB
-            setsockopt(clientSocket, SOL_SOCKET, SO_RCVBUF, (char*)&buf_size, sizeof(buf_size));
-            setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF, (char*)&buf_size, sizeof(buf_size));
-
-            if (peer)
-            {
-                // get ipv4 of the client
-                char ipStr[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &(addr.sin_addr), ipStr, INET_ADDRSTRLEN);
-                IPv4Address ip;
-                ip.fromString(ipStr);
-                ((Peer*)peer)->address = ip;
-            }
             });
         acceptThread.detach();
         return EFI_SUCCESS;
