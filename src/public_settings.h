@@ -137,9 +137,9 @@ static constexpr long long NEURON_VALUE_LIMIT = 1LL;
 
 // Signing difficulty
 #ifdef TESTNET
-#define TARGET_TICK_VOTE_SIGNATURE 0x07FFFFFFULL  // around 32 signing operations per ID
+#define TARGET_TICK_VOTE_SIGNATURE 0x07FFFFFFU  // around 32 signing operations per ID
 #else
-#define TARGET_TICK_VOTE_SIGNATURE 0x100095CBEULL // around 7000 signing operations per ID
+#define TARGET_TICK_VOTE_SIGNATURE 0x00095CBEU // around 7000 signing operations per ID
 #endif
 
 // include commonly needed definitions
