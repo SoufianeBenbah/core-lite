@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iomanip>
 #include <cstring>
 #include <lib/platform_common/compiler_warnings.h>
 #include <lib/platform_common/qintrin.h>
