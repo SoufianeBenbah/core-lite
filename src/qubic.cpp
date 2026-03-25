@@ -37,7 +37,8 @@
 #define system qsystem
 #endif
 
-// #define NO_QSURV
+// proposal did not pass
+#define NO_QSURV
 
 //#define INCLUDE_CONTRACT_TEST_EXAMPLES
 
